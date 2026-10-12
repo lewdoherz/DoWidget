@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+*.spec
+*.log
+.env
+.tools/
+_smoke*.py
+_smoke*.png

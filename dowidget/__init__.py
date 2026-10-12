@@ -1,0 +1,1 @@
+"""DoWidget desktop application."""

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dowidget"
+version = "0.2.0"
+description = "Compact desktop AI balance and subscription usage widget"
+requires-python = ">=3.11"
+dependencies = ["PySide6-Essentials>=6.8,<7", "requests>=2.32,<3", "keyring>=25,<26"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pyinstaller>=6.16,<7"]
+
+[project.scripts]
+dowidget = "dowidget.app:main"
+
+[project.gui-scripts]
+dowidget-gui = "dowidget.app:main"
+
+[tool.setuptools.packages.find]
+include = ["dowidget*"]
+
+[tool.setuptools.package-data]
+dowidget = ["assets/*.png", "assets/*.ico", "assets/*.svg", "assets/SOURCES.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
