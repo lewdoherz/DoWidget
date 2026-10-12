@@ -28,7 +28,7 @@ def compact_widget(tmp_path):
 
 def test_reload_icon_recovers_stale_demo_state_without_switching_view(compact_widget):
     widget = compact_widget
-    state = widget.states["deepseek"]
+    state = widget.runtime.accounts["deepseek-default"].state
     state.fail(ProviderError("Offline demo.", "network"), 1, 300)
     widget.render()
     assert state.status == "stale"
@@ -60,7 +60,7 @@ def test_translucent_margins_remain_hit_testable_and_rows_remain_opaque(compact_
     image = widget.grab().toImage()
     assert image.hasAlphaChannel()
     assert 0 < image.pixelColor(3, 3).alpha() < 255
-    card = widget.compact_cards["deepseek"].grab().toImage()
+    card = widget.compact_cards["deepseek-default"].grab().toImage()
     assert card.pixelColor(card.width() // 2, card.height() // 2).alpha() == 255
 
 

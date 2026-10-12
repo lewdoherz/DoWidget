@@ -417,3 +417,15 @@ def test_windows_cmd_metacharacter_path_is_rejected(tmp_path):
         with pytest.raises(ProviderError):
             _StdioTransport(tmp_path, False)
     popen.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["account/rateLimitResetCredit/consume", "thread/start", "turn/start"])
+def test_monitor_cannot_redeem_resets_or_start_quota_consuming_work(tmp_path, method):
+    client, transport = provider(tmp_path)
+    client._ensure()
+    before = list(transport.sent)
+    with pytest.raises(ProviderError) as error:
+        client._rpc(method)
+    assert error.value.kind == "unavailable"
+    assert transport.sent == before
+    assert client.fetch().windows[0].remaining == Decimal(75)

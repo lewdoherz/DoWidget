@@ -1,6 +1,5 @@
 """Native desktop surface; provider work stays off the GUI thread."""
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html import escape
@@ -9,19 +8,21 @@ import re
 import sys
 import time
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QSize, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QSize, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QScrollArea, QSpinBox,
+    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .icons import app_icon, control_icon
-from .models import Balance, ProviderError, Snapshot, UsageWindow
-from .providers import CodexProvider, DeepSeekProvider
-from .state import ProviderState
-from .storage import ConfigStore, CredentialStore
+from .catalog import PROVIDERS, connection_caption, connection_title
+from .connections import Connection, new_connection_id
+from .models import Balance, MoneyMetric, ProviderError, Snapshot, UsageWindow
+from .runtime import Runtime
+from .settings import Settings
+from .storage import ConfigStore
+from .ui_helpers import label, metric_text
 from .window import EdgeResize
 from .tray import TrayController
 
@@ -46,18 +47,12 @@ QLabel#warning { color: #ffd28a; }
 QPushButton { background: #304159; border: 1px solid #4b6080; border-radius: 5px; padding: 6px 10px; }
 QPushButton:hover { background: #405777; }
 QPushButton:disabled { color: #8996aa; background: #232d3d; }
-QLineEdit, QSpinBox { background: #222c3b; padding: 6px; border: 1px solid #4b6080; border-radius: 4px; }
+QLineEdit, QSpinBox, QComboBox, QListWidget { background: #222c3b; padding: 6px; border: 1px solid #4b6080; border-radius: 4px; }
 QCheckBox { spacing: 8px; }
 QScrollArea { border: none; }
 """
 
 
-def label(text, name="", wrap=True):
-    result = QLabel(text)
-    result.setTextFormat(Qt.TextFormat.PlainText)
-    result.setWordWrap(wrap)
-    result.setObjectName(name)
-    return result
 
 
 def local_time(value):
@@ -84,6 +79,11 @@ def compact_window_name(name):
         return "5h"
     if name == "Codex · weekly window":
         return "Week"
+    if name.startswith("Claude Enterprise "):
+        period = name.removeprefix("Claude Enterprise ")
+        for value, short in (("monthly", "Month"), ("weekly", "Week"), ("daily", "Day")):
+            if period == value or period.startswith(value + " ("):
+                return short + " spend cap" + period.removeprefix(value)
     return name.removeprefix("codex · ").removeprefix("Codex · ")
 
 
@@ -104,6 +104,8 @@ def provider_tooltip(state, title=""):
             lines.append(f"{window.name}: {value}")
             if window.resets_at:
                 lines.append(f"Resets: {local_time(window.resets_at)}")
+        for metric in snapshot.metrics:
+            lines.append(metric.label + ": " + metric_text(metric))
         if snapshot.note:
             lines.append(snapshot.note)
     lines.append("Last successful update: " + (local_time(state.updated_at) if state.updated_at else "Never"))
@@ -111,29 +113,6 @@ def provider_tooltip(state, title=""):
     return "<qt>" + "<br>".join(escape(line) for line in lines) + "</qt>"
 
 
-class Jobs(QObject):
-    finished = Signal(str, object, object)
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.executors = {key: ThreadPoolExecutor(max_workers=1, thread_name_prefix=key)
-                          for key in ("deepseek", "codex")}
-
-    def submit(self, key, operation, function):
-        future = self.executors[key].submit(function)
-
-        def complete(done):
-            try:
-                self.finished.emit(operation, done.result(), None)
-            except ProviderError as error:
-                self.finished.emit(operation, None, error)
-            except Exception:
-                self.finished.emit(operation, None, ProviderError("Operation failed. Please retry."))
-        future.add_done_callback(complete)
-
-    def shutdown(self):
-        for executor in self.executors.values():
-            executor.shutdown(wait=False, cancel_futures=True)
 
 
 class DragHeader(QLabel):
@@ -192,6 +171,9 @@ class ProviderCard(QFrame):
                     parts.append(f"Topped up {balance.currency} {format(balance.topped_up, 'f')}")
                 if parts:
                     self.content.addWidget(label(" · ".join(parts), "muted"))
+            for metric in snapshot.metrics:
+                self.content.addWidget(label(metric.label, "muted"))
+                self.content.addWidget(label(metric_text(metric), "amount"))
             for window in snapshot.windows:
                 self.content.addWidget(label(window.name, "muted"))
                 amount = "Unknown allowance" if window.remaining is None else f"{window.remaining:.1f}% remaining"
@@ -209,7 +191,7 @@ class ProviderCard(QFrame):
 
 
 class CompactCard(QFrame):
-    def __init__(self, provider, title):
+    def __init__(self, provider, title, caption=""):
         super().__init__()
         self.title = title
         self.setObjectName("compactCard")
@@ -226,10 +208,20 @@ class CompactCard(QFrame):
         logo.setPixmap(pixmap.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         logo.setAccessibleName(title)
         layout.addWidget(logo)
+        values_layout = QVBoxLayout()
+        values_layout.setContentsMargins(0, 0, 0, 0)
+        values_layout.setSpacing(1)
+        if caption:
+            self.caption = label(caption, "muted")
+            self.caption.setMinimumWidth(0)
+            self.caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            self.caption.setStyleSheet("font-size: 11px;")
+            values_layout.addWidget(self.caption)
         self.value = label("—", "compactAmount")
         self.value.setMinimumWidth(0)
         self.value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        layout.addWidget(self.value, 1)
+        values_layout.addWidget(self.value)
+        layout.addLayout(values_layout, 1)
         self.indicator = label("?", wrap=False)
         self.indicator.setFixedWidth(16)
         self.indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -244,6 +236,8 @@ class CompactCard(QFrame):
             values.extend(f"{name if names.count(name) == 1 else window.name}: " +
                           ("Unknown" if window.remaining is None else f"{window.remaining:.1f}%")
                           for name, window in zip(names, snapshot.windows))
+            if not snapshot.windows:
+                values.extend(metric.label + ": " + metric_text(metric) for metric in snapshot.metrics)
         self.value.setText(" · ".join(values) if values else "—")
         self.value.setAccessibleName(self.title + ": " + self.value.text())
         status = connection_status(state)
@@ -268,135 +262,6 @@ class CompactCard(QFrame):
         self.indicator.setToolTip(tooltip)
 
 
-class Settings(QDialog):
-    def __init__(self, window):
-        super().__init__(window)
-        self.owner = window
-        self.setWindowTitle("DoWidget settings")
-        self.setMinimumWidth(430)
-        self.resize(450, min(800, QApplication.primaryScreen().availableGeometry().height() - 80))
-        outer = QVBoxLayout(self)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        scroll.setWidget(content)
-        outer.addWidget(scroll)
-        layout.addWidget(label("DeepSeek API balance", "title"))
-        layout.addWidget(label("Enter your own API key. Keys are masked and never saved in the configuration file.", "muted"))
-        self.key = QLineEdit()
-        self.key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key.setPlaceholderText("Enter new DeepSeek API key")
-        layout.addWidget(self.key)
-        self.persist = QCheckBox("Remember in operating system credential store")
-        self.persist.setChecked(window.credentials.available)
-        self.persist.setEnabled(window.credentials.available)
-        layout.addWidget(self.persist)
-        self.storage_info = label(window.credentials.status, "muted")
-        layout.addWidget(self.storage_info)
-        buttons = QHBoxLayout()
-        self.connect = QPushButton("Connect / replace key")
-        self.disconnect = QPushButton("Disconnect DeepSeek")
-        buttons.addWidget(self.connect)
-        buttons.addWidget(self.disconnect)
-        layout.addLayout(buttons)
-        self.connect.clicked.connect(self.connect_deepseek)
-        self.disconnect.clicked.connect(self.disconnect_deepseek)
-        layout.addWidget(label("Codex subscription allowance", "title"))
-        layout.addWidget(label("Requires the official Codex CLI and a ChatGPT subscription sign-in. DoWidget uses its own isolated sign-in, not credentials from other apps. This is not general ChatGPT message usage or OpenAI API billing.", "muted"))
-        layout.addWidget(label("The app-server command is documented as experimental and not supported for production workloads. DoWidget uses stdio and stable account methods, not experimental API opt-in. This caveat concerns integration support—not the subscription or the accuracy of service-reported percentages. CLI/API changes may require a DoWidget update.", "warning"))
-        layout.addWidget(label("Sign-in uses the OS credential store when available; otherwise it lasts only for this session. No browser cookies are collected.", "muted"))
-        self.codex_persist = QCheckBox("Remember Codex sign-in in OS credential store")
-        self.codex_persist.setChecked(window.credentials.available)
-        self.codex_persist.setEnabled(window.credentials.available)
-        layout.addWidget(self.codex_persist)
-        buttons = QHBoxLayout()
-        self.login = QPushButton("Sign in with ChatGPT")
-        self.logout = QPushButton("Disconnect Codex")
-        buttons.addWidget(self.login)
-        buttons.addWidget(self.logout)
-        layout.addLayout(buttons)
-        self.login.clicked.connect(window.login_codex)
-        self.logout.clicked.connect(window.logout_codex)
-        layout.addWidget(label("Widget behavior", "title"))
-        form = QFormLayout()
-        self.interval = QSpinBox()
-        self.interval.setRange(1, 1440)
-        self.interval.setSuffix(" minutes")
-        self.interval.setValue(window.config.interval_minutes)
-        form.addRow("Refresh interval", self.interval)
-        self.auto = QCheckBox("Automatically refresh")
-        self.auto.setChecked(window.config.auto_refresh)
-        form.addRow(self.auto)
-        self.top = QCheckBox("Always on top")
-        self.top.setChecked(window.config.always_on_top)
-        form.addRow(self.top)
-        self.minimize_tray = QCheckBox("Minimize to system tray")
-        self.minimize_tray.setChecked(window.config.minimize_to_tray)
-        form.addRow(self.minimize_tray)
-        form.addRow(label("Tray click restores the widget; its menu has Show, Refresh, Settings, and Quit. If no tray is available, normal taskbar minimization is used.", "muted"))
-        layout.addLayout(form)
-        layout.addWidget(label("Failed requests retain the last value as stale. Automatic and manual refresh respect failure backoff.", "muted"))
-        self.info = label("", "warning")
-        layout.addWidget(self.info)
-        apply = QPushButton("Save behavior")
-        apply.clicked.connect(self.save_behavior)
-        layout.addWidget(apply)
-        close = QPushButton("Close settings")
-        close.clicked.connect(self.accept)
-        layout.addWidget(close)
-        self.update_controls()
-
-    def update_controls(self):
-        w = self.owner
-        self.connect.setEnabled(not w.states["deepseek"].busy and not w.demo)
-        self.disconnect.setEnabled(not w.states["deepseek"].busy and not w.demo)
-        self.login.setEnabled(not w.states["codex"].busy and not w.demo)
-        self.logout.setEnabled(not w.states["codex"].busy and not w.demo)
-        self.storage_info.setText(w.credentials.status)
-        self.info.setText(w.notice.text())
-
-    def connect_deepseek(self):
-        key = self.key.text().strip()
-        if not key:
-            self.info.setText("Enter an API key first.")
-            return
-        try:
-            status = self.owner.credentials.connect(key, self.persist.isChecked())
-            self.owner.key = key
-            self.key.clear()
-            self.owner.states["deepseek"].reset()
-            self.owner.notice.setText(status)
-            self.owner.refresh(True)
-        except ProviderError as error:
-            self.storage_info.setText(self.owner.credentials.status)
-            self.info.setText(f"{error} Uncheck Remember to try session-only storage.")
-
-    def disconnect_deepseek(self):
-        try:
-            self.owner.credentials.disconnect()
-            self.owner.key = None
-            self.owner.states["deepseek"].reset(message="Connect your API key in settings.")
-            self.owner.notice.setText("DeepSeek disconnected.")
-            self.owner.render()
-        except ProviderError as error:
-            self.info.setText(str(error))
-
-    def save_behavior(self):
-        w = self.owner
-        w.config.interval_minutes = self.interval.value()
-        w.config.auto_refresh = self.auto.isChecked()
-        w.config.always_on_top = self.top.isChecked()
-        w.config.minimize_to_tray = self.minimize_tray.isChecked()
-        if w.save_config():
-            w.tray.set_enabled(w.config.minimize_to_tray)
-            w.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, w.config.always_on_top)
-            w.show()
-            now = time.monotonic()
-            for state in w.states.values():
-                if state.status == "ready":
-                    state.next_due = now + w.config.interval_minutes * 60
-            self.info.setText("Behavior saved.")
 
 
 class Widget(QWidget):
@@ -418,16 +283,11 @@ class Widget(QWidget):
         self.geometry_timer.setSingleShot(True)
         self.geometry_timer.setInterval(300)
         self.geometry_timer.timeout.connect(self.save_position)
-        self.credentials = CredentialStore()
-        self.key = None if demo else self.credentials.get()
-        self.deepseek = DeepSeekProvider()
-        self.codex = CodexProvider(data_dir / "codex", persistent=self.credentials.available)
-        self.codex_persistent = self.credentials.available
-        self.states = {"deepseek": ProviderState(), "codex": ProviderState()}
-        self.states["deepseek"].reset(message="Connect your API key in settings.")
-        self.states["codex"].reset(message="Install the official Codex CLI, then sign in through settings. General ChatGPT message limits are not supplied by this integration.")
-        self.jobs = Jobs(self)
-        self.jobs.finished.connect(self.completed)
+        if demo:
+            for provider in ("deepseek", "claude", "gemini", "grok", "glm"):
+                self.config.connections.append(Connection(new_connection_id(), provider,
+                    PROVIDERS[provider][0] + " DEMO", source="local" if provider in ("gemini", "glm") else "api"))
+        self.runtime = Runtime(self.config, data_dir, self.save_config, self, demo=demo)
         self.settings = None
         self.closing = False
         outer = QVBoxLayout(self)
@@ -462,11 +322,10 @@ class Widget(QWidget):
         root.addLayout(header)
         self.view_stack = QStackedWidget()
         self.view_stack.setObjectName("providerStack")
-        self.cards = {"deepseek": ProviderCard("DeepSeek · API balance"),
-                      "codex": ProviderCard("Codex · subscription")}
-        self.compact_cards = {"deepseek": CompactCard("deepseek", "DeepSeek · API balance"),
-                              "codex": CompactCard("openai", "Codex · subscription")}
-        for card_set in (self.cards, self.compact_cards):
+        self.cards, self.compact_cards = {}, {}
+        self.card_layouts = []
+        self._card_signature = None
+        for _ in range(2):
             scroll = QScrollArea()
             scroll.setObjectName("providerScroll")
             scroll.viewport().setObjectName("providerViewport")
@@ -477,8 +336,7 @@ class Widget(QWidget):
             cards = QVBoxLayout(content)
             cards.setContentsMargins(0, 0, 0, 0)
             cards.setSpacing(5)
-            for card in card_set.values():
-                cards.addWidget(card)
+            self.card_layouts.append(cards)
             cards.addStretch()
             scroll.setWidget(content)
             self.view_stack.addWidget(scroll)
@@ -503,6 +361,8 @@ class Widget(QWidget):
         self.notice_indicator.setFixedWidth(16)
         row.addWidget(self.notice_indicator)
         root.addLayout(row)
+        self.runtime.changed.connect(self.render)
+        self.runtime.notice.connect(self.set_notice)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.config.always_on_top)
         self.apply_view()
         self.restore_position()
@@ -631,10 +491,24 @@ class Widget(QWidget):
 
     def seed_demo(self):
         now = datetime.now(timezone.utc)
-        self.states["deepseek"].succeed(Snapshot(balances=(Balance("CNY", Decimal("123.4567"), Decimal("3.4567"), Decimal("120")),), demo=True), time.monotonic(), now, 300)
-        self.states["codex"].succeed(Snapshot(windows=(UsageWindow("Codex · 5-hour window", Decimal("72.5"), now + timedelta(hours=2)), UsageWindow("Codex · weekly window", Decimal("41"), now + timedelta(days=3))), note="Illustrative values only", demo=True), time.monotonic(), now, 300)
+        for index, account in enumerate(self.runtime.accounts.values()):
+            provider = account.connection.provider
+            if provider in ("deepseek", "grok"):
+                snapshot = Snapshot(balances=(Balance("CNY" if provider == "deepseek" else "USD",
+                    Decimal("123.4567") if index == 0 else Decimal("24.8400")),), demo=True)
+            else:
+                snapshot = Snapshot(windows=(
+                    UsageWindow("Codex · 5-hour window" if provider == "codex" else "Monthly" if provider == "claude" else "5h",
+                                Decimal("72.5"), now + timedelta(hours=2)),
+                    UsageWindow("Codex · weekly window" if provider == "codex" else "Week",
+                                None if provider == "gemini" else Decimal("41"), now + timedelta(days=3))),
+                    note="Illustrative values only; not live account data.", demo=True,
+                    metrics=(MoneyMetric("Monthly spend-cap remaining", "USD", Decimal("24.875")),) if provider == "claude" else ())
+            account.state.succeed(snapshot, time.monotonic(), now, 300)
 
     def tick(self):
+        if not self.demo:
+            self.runtime.expire_local()
         if self.config.auto_refresh and not self.demo:
             self.refresh(False)
 
@@ -642,79 +516,50 @@ class Widget(QWidget):
         if self.demo:
             self.seed_demo()
             self.render()
-            return
-        now = time.monotonic()
-        started = False
-        if self.key and self.states["deepseek"].begin(now, manual):
-            key = self.key
-            self.jobs.submit("deepseek", "deepseek", lambda: self.deepseek.fetch(key))
-            started = True
-        if self.config.codex_enabled and self.states["codex"].begin(now, manual):
-            self.jobs.submit("codex", "codex", self.codex.fetch)
-            started = True
-        if manual:
-            self.notice.setText("Refreshing…" if started else "No refresh started: connect in settings, or wait for the active request / retry cooldown.")
-        if started or manual:
-            self.render()
-
-    def login_codex(self):
-        state = self.states["codex"]
-        if state.busy or self.demo:
-            return
-        persistent = self.settings.codex_persist.isChecked() if self.settings else self.credentials.available
-        state.busy = True
-        self.notice.setText("Complete the official sign-in in your browser. Sign-in expires after three minutes.")
-        def sign_in():
-            if persistent != self.codex_persistent:
-                self.codex.logout()
-                self.codex.close()
-                if self.closing:
-                    raise ProviderError("Sign-in cancelled.")
-                self.codex = CodexProvider(self.data_dir / "codex", persistent=persistent)
-                self.codex_persistent = persistent
-            self.codex.login()
-        self.jobs.submit("codex", "login", sign_in)
-        self.render()
-
-    def logout_codex(self):
-        state = self.states["codex"]
-        if state.busy or self.demo:
-            return
-        state.busy = True
-        self.jobs.submit("codex", "logout", self.codex.logout)
-        self.render()
-
-    def completed(self, operation, result, error):
-        if self.closing:
-            return
-        key = operation if operation in self.states else "codex"
-        state = self.states[key]
-        now = time.monotonic()
-        if error:
-            state.fail(error, now, self.config.interval_minutes * 60)
-            self.notice.setText(str(error))
-        elif operation == "login":
-            self.config.codex_enabled = True
-            self.save_config()
-            state.reset()
-            self.notice.setText("Codex signed in. Retrieving subscription usage…")
-            self.refresh(True)
-        elif operation == "logout":
-            self.config.codex_enabled = False
-            self.save_config()
-            state.reset(message="Codex disconnected. Sign in through settings to reconnect.")
-            self.notice.setText("DoWidget's Codex sign-in disconnected.")
         else:
-            state.succeed(result, now, datetime.now(timezone.utc), self.config.interval_minutes * 60)
-            self.notice.setText("")
-        self.render()
+            self.runtime.refresh(manual)
+
+    def set_notice(self, text):
+        self.notice.setText(text)
+        self.update_notice()
+        if self.settings:
+            self.settings.update_controls()
+
+    def rebuild_cards(self):
+        signature = tuple(account.connection for account in self.runtime.accounts.values())
+        if signature == self._card_signature:
+            return
+        self._card_signature = signature
+        for layout in self.card_layouts:
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+        self.cards, self.compact_cards = {}, {}
+        for identifier, account in self.runtime.accounts.items():
+            connection = account.connection
+            title = connection_title(connection)
+            card = ProviderCard(title)
+            if connection.model_label:
+                card.layout.insertWidget(1, label("Model label: " + connection.model_label + " (display only)", "muted"))
+            self.cards[identifier] = card
+            self.compact_cards[identifier] = CompactCard(PROVIDERS[connection.provider][2], title,
+                                                        connection_caption(connection))
+            self.card_layouts[0].addWidget(card)
+            self.card_layouts[1].addWidget(self.compact_cards[identifier])
+        if not self.cards:
+            for layout in self.card_layouts:
+                layout.addWidget(label("No connections. Open Settings to add an account or API source.", "muted"))
+        for layout in self.card_layouts:
+            layout.addStretch()
 
     def render(self):
+        self.rebuild_cards()
         card_set = self.compact_cards if self.config.view == "compact" else self.cards
         for key, card in card_set.items():
-            card.render(self.states[key])
+            card.render(self.runtime.accounts[key].state)
         self.update_notice()
-        self.refresh_button.setEnabled(not any(state.busy for state in self.states.values()))
+        self.refresh_button.setEnabled(not any(account.state.busy for account in self.runtime.accounts.values()))
         if self.settings:
             self.settings.update_controls()
 
@@ -753,9 +598,8 @@ class Widget(QWidget):
         self.timer.stop()
         self.geometry_timer.stop()
         self.save_position()
-        self.codex.close()
+        self.runtime.shutdown()
         self.tray.close()
-        self.jobs.shutdown()
         event.accept()
 
 

@@ -22,6 +22,15 @@ class Balance:
 
 
 @dataclass(frozen=True)
+class MoneyMetric:
+    """Labeled monetary information, not necessarily a wallet balance."""
+    label: str
+    currency: str
+    amount: Decimal
+    unit: str = "major"
+
+
+@dataclass(frozen=True)
 class UsageWindow:
     name: str
     remaining: Decimal | None
@@ -34,6 +43,8 @@ class Snapshot:
     windows: tuple[UsageWindow, ...] = ()
     note: str = ""
     demo: bool = False
+    metrics: tuple[MoneyMetric, ...] = ()
+    observed_at: datetime | None = None
 
 
 def remaining_percentage(*, used_percent=None, used=None, total=None) -> Decimal | None:

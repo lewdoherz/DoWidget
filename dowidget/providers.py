@@ -330,6 +330,9 @@ class CodexProvider:
         self._notifications.clear()
 
     def _rpc(self, method, params=None):
+        if method not in ("initialize", "account/read", "account/rateLimits/read",
+                          "account/login/start", "account/logout"):
+            raise ProviderError("DoWidget permits only authentication and read-only account usage methods.", "unavailable")
         transport = self._transport
         if transport is None or self._closed.is_set():
             raise ProviderError(CODEX_REQUEST)

@@ -1,5 +1,5 @@
 """Nonsecret preferences and explicitly allowlisted OS credential storage."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import importlib
 import json
 import math
@@ -9,10 +9,14 @@ import sys
 import tempfile
 
 from .models import ProviderError
+from .connections import (
+    Provider, Connection, default_connections, valid_connection_id,
+    validate_connections, serialize_connections,
+)
 
 
-_SERVICE = "DoWidget.DeepSeek"
-_USERNAME = "api-key"
+_LEGACY_SERVICE = "DoWidget.DeepSeek"
+_LEGACY_USERNAME = "api-key"
 _UNAVAILABLE = "Secure credential storage is unavailable; use this session only."
 _SESSION = "Session only; the API key is not saved."
 _SAVED = "API key saved securely in the operating system keyring."
@@ -39,7 +43,12 @@ def _discover_backend():
 class CredentialStore:
     """Keep session secrets out of repr, config, and backend error messages."""
 
-    def __init__(self):
+    def __init__(self, connection_id: str = "deepseek-default", provider: str = "deepseek"):
+        if not isinstance(provider, str) or provider not in Provider._value2member_map_ or not valid_connection_id(connection_id, provider):
+            raise ValueError("Invalid connection metadata.")
+        self._service = "DoWidget.Connections." + provider
+        self._username = connection_id
+        self._legacy = connection_id == "deepseek-default" and provider == "deepseek"
         self._backend = _discover_backend()
         self._session_key: str | None = None
         self.available = False
@@ -61,7 +70,7 @@ class CredentialStore:
         if self._backend is None:
             return None
         try:
-            key = self._backend.get_password(_SERVICE, _USERNAME)
+            key = self._backend.get_password(self._service, self._username)
         except Exception:
             self.available = False
             self.status = _READ_FAILED
@@ -71,7 +80,45 @@ class CredentialStore:
             self._session_key = key
             self.status = _SAVED
             return key
+        if self._legacy:
+            return self._migrate_legacy()
         return None
+
+    def _migrate_legacy(self) -> str | None:
+        try:
+            key = self._backend.get_password(_LEGACY_SERVICE, _LEGACY_USERNAME)
+        except Exception:
+            self.available = False
+            self.status = _READ_FAILED
+            return None
+        if not isinstance(key, str) or not key:
+            return None
+        self._session_key = key
+        try:
+            # Never remove the old credential until the new slot is saved.
+            self._backend.set_password(self._service, self._username, key)
+        except Exception:
+            self.available = False
+            self.status = _SAVE_FAILED
+            return key
+        try:
+            self._remove_legacy()
+        except ProviderError:
+            return key
+        self.status = _SAVED
+        return key
+
+    def _remove_legacy(self) -> None:
+        if not self._legacy or self._backend is None:
+            return
+        try:
+            if self._backend.get_password(_LEGACY_SERVICE, _LEGACY_USERNAME) is not None:
+                self._backend.delete_password(_LEGACY_SERVICE, _LEGACY_USERNAME)
+        except Exception:
+            self.available = False
+            self.status = _REMOVE_FAILED
+            raise ProviderError(_REMOVE_FAILED, "storage_unavailable") from None
+        self.available = True
 
     def _remove_saved(self) -> None:
         if self._backend is None:
@@ -79,13 +126,14 @@ class CredentialStore:
         try:
             # Missing credentials are success; a generic PasswordDeleteError is
             # not, because backends also use it for genuine deletion failures.
-            if self._backend.get_password(_SERVICE, _USERNAME) is not None:
-                self._backend.delete_password(_SERVICE, _USERNAME)
+            if self._backend.get_password(self._service, self._username) is not None:
+                self._backend.delete_password(self._service, self._username)
         except Exception:
             self.available = False
             self.status = _REMOVE_FAILED
             raise ProviderError(_REMOVE_FAILED, "storage_unavailable") from None
         self.available = True
+        self._remove_legacy()
 
     def connect(self, key: str, persist: bool) -> str:
         # A failed OS operation must not discard the caller's usable session key.
@@ -98,12 +146,13 @@ class CredentialStore:
             self.status = _SAVE_FAILED
             raise ProviderError(_SAVE_FAILED, "storage_unavailable") from None
         try:
-            self._backend.set_password(_SERVICE, _USERNAME, key)
+            self._backend.set_password(self._service, self._username, key)
         except Exception:
             self.available = False
             self.status = _SAVE_FAILED
             raise ProviderError(_SAVE_FAILED, "storage_unavailable") from None
         self.available = True
+        self._remove_legacy()
         self.status = _SAVED
         return self.status
 
@@ -122,7 +171,7 @@ class Config:
     interval_minutes: int = 5
     auto_refresh: bool = True
     always_on_top: bool = False
-    codex_enabled: bool = False
+    connections: list[Connection] = field(default_factory=default_connections)
     x: int | None = None
     y: int | None = None
     width: int = 380
@@ -138,7 +187,7 @@ def _validated_config(values: dict) -> Config:
     interval = values.get("interval_minutes")
     if type(interval) is int and 1 <= interval <= 1440:
         defaults.interval_minutes = interval
-    for field in ("auto_refresh", "always_on_top", "codex_enabled", "minimize_to_tray"):
+    for field in ("auto_refresh", "always_on_top", "minimize_to_tray"):
         value = values.get(field)
         if type(value) is bool:
             setattr(defaults, field, value)
@@ -156,6 +205,10 @@ def _validated_config(values: dict) -> Config:
     view = values.get("view")
     if type(view) is str and view in ("compact", "detailed"):
         defaults.view = view
+    if "connections" in values:
+        defaults.connections = validate_connections(values["connections"])
+    elif values.get("codex_enabled") is True:
+        defaults.connections[1] = replace(defaults.connections[1], enabled=True)
     return defaults
 
 
@@ -174,12 +227,13 @@ class ConfigStore:
     def save(self, config: Config) -> None:
         # Whitelist both input and output; additional attributes are never saved.
         fields = (
-            "interval_minutes", "auto_refresh", "always_on_top", "codex_enabled",
+            "interval_minutes", "auto_refresh", "always_on_top", "connections",
             "x", "y", "width", "height", "compact_width", "compact_height", "view",
             "minimize_to_tray",
         )
         validated = _validated_config({field: getattr(config, field, None) for field in fields})
-        values = {field: getattr(validated, field) for field in fields}
+        values = {field: getattr(validated, field) for field in fields if field != "connections"}
+        values["connections"] = serialize_connections(validated.connections)
         temporary: Path | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
